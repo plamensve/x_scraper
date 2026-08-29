@@ -1,18 +1,15 @@
 import os
 import re
 import time
-import pandas as pd
+from decimal import Decimal, InvalidOperation
 
+import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from supabase import create_client, Client
-
-# ============================================================
-# SETTINGS
-# ============================================================
 
 BASE_URL = "https://fuelo.net/prices/last_updated"
 OUTPUT_CSV = "fuelo_all_prices.csv"
@@ -25,21 +22,17 @@ PAGE_DELAY_SECONDS = 1.0
 INITIAL_LOAD_SECONDS = 3.0
 HEADLESS = True
 
-# Rows representing the same logical observation are considered duplicates.
-# created_at is intentionally included so a genuine later price observation is preserved.
-DEDUP_COLUMNS = [
-    "created_at",
-    "city",
-    "station",
-    "fuel",
-    "price",
-    "region",
-    "location",
+COLUMNS = ["created_at", "city", "station", "fuel", "price", "region", "location"]
+
+# Exact duplicate observations inside the same scrape.
+IN_RUN_DEDUP_COLUMNS = [
+    "created_at", "city", "station", "fuel", "price", "region", "location"
 ]
 
-# ============================================================
-# REGION TO CITIES MAPPING
-# ============================================================
+# Identifies one fuel product at one physical station.
+# created_at and price are deliberately excluded: they describe the station state,
+# not the identity of the station/product.
+STATION_FUEL_KEY_COLUMNS = ["city", "station", "fuel", "region", "location"]
 
 REGION_CITIES = {
     "Благоевград": ["Благоевград", "Петрич", "Сандански", "Гоце Делчев", "Разлог", "Банско", "Симитли", "Кресна", "Хаджидимово", "Якоруда", "Кулата"],
@@ -73,8 +66,6 @@ REGION_CITIES = {
 }
 
 CITY_TO_REGION = {city: region for region, cities in REGION_CITIES.items() for city in cities}
-
-COLUMNS = ["created_at", "city", "station", "fuel", "price", "region", "location"]
 
 STATION_BRANDS = [
     ("omv", "OMV"), ("shell", "Shell"), ("lukoil", "Lukoil"), ("лукойл", "Lukoil"),
@@ -112,7 +103,10 @@ def create_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-gpu")
     options.add_argument("--remote-debugging-port=9222")
-    options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151.0.0.0 Safari/537.36")
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+    )
     driver = webdriver.Chrome(options=options)
     driver.set_page_load_timeout(45)
     return driver
@@ -145,6 +139,7 @@ def normalize_fuel_name(product):
     if not raw:
         return None
     p = raw.casefold()
+
     if any(x in p for x in ["електр", "electric", "kwh", "kw"]):
         return None
     if any(x in p for x in ["lpg", "autogas", "автогаз", "пропан", "бутан", "blue force gas"]):
@@ -152,7 +147,11 @@ def normalize_fuel_name(product):
     if any(x in p for x in ["метан", "methane", "cng"]):
         return "Метан"
     if any(x in p for x in ["diesel", "дизел", "нафта"]):
-        premium_tokens = ["premium", "премиум", "maxxmotion", "ecto", "v-power", "double filtered", "green force", "diesel+", "diesel +", "topdiesel", "топдизел"]
+        premium_tokens = [
+            "premium", "премиум", "maxxmotion", "ecto", "v-power",
+            "double filtered", "green force", "diesel+", "diesel +",
+            "topdiesel", "топдизел",
+        ]
         return "Дизел премиум" if any(x in p for x in premium_tokens) else "Дизел"
     if re.search(r"(?<!\d)100(?!\d)", p):
         return "Бензин A100"
@@ -162,6 +161,7 @@ def normalize_fuel_name(product):
         return "Бензин A95"
     if any(x in p for x in ["бензин", "gasoline", "petrol"]):
         return "Бензин"
+
     print(f"[FUEL] Unmapped product: {raw}")
     return None
 
@@ -169,15 +169,25 @@ def normalize_fuel_name(product):
 def parse_created_at(card_text):
     card_text = normalize_spaces(card_text) or ""
     now_sofia = datetime.now(ZoneInfo("Europe/Sofia"))
-    absolute = re.search(r"(?:последно\s+обновяване|обновено|актуализирано)?\s*(\d{1,2}\.\d{1,2}\.\d{4})\s+(\d{1,2}:\d{2})", card_text, flags=re.IGNORECASE)
+
+    absolute = re.search(
+        r"(?:последно\s+обновяване|обновено|актуализирано)?\s*"
+        r"(\d{1,2}\.\d{1,2}\.\d{4})\s+(\d{1,2}:\d{2})",
+        card_text,
+        flags=re.IGNORECASE,
+    )
     if absolute:
-        local_dt = datetime.strptime(f"{absolute.group(1)} {absolute.group(2)}", "%d.%m.%Y %H:%M").replace(tzinfo=ZoneInfo("Europe/Sofia"))
+        local_dt = datetime.strptime(
+            f"{absolute.group(1)} {absolute.group(2)}", "%d.%m.%Y %H:%M"
+        ).replace(tzinfo=ZoneInfo("Europe/Sofia"))
         return local_dt.astimezone(ZoneInfo("UTC")).isoformat()
+
     today_match = re.search(r"днес\s+(?:в\s+)?(\d{1,2}:\d{2})", card_text, flags=re.IGNORECASE)
     if today_match:
         hour, minute = map(int, today_match.group(1).split(":"))
         local_dt = now_sofia.replace(hour=hour, minute=minute, second=0, microsecond=0)
         return local_dt.astimezone(ZoneInfo("UTC")).isoformat()
+
     return now_sofia.astimezone(ZoneInfo("UTC")).isoformat()
 
 
@@ -190,14 +200,18 @@ def normalize_station_name(station_name, city=None):
     station_name = normalize_spaces(station_name)
     if not station_name:
         return None
+
     normalized = station_name.casefold()
     for prefix, canonical in STATION_BRANDS:
         if normalized.startswith(prefix.casefold()):
             return canonical
+
     fallback = re.sub(r"^бензиностанция\s+", "", station_name, flags=re.IGNORECASE).strip()
     city = normalize_spaces(city)
     if city:
-        fallback = re.sub(rf"\s*[-,:]?\s*{re.escape(city)}\s*$", "", fallback, flags=re.IGNORECASE).strip()
+        fallback = re.sub(
+            rf"\s*[-,:]?\s*{re.escape(city)}\s*$", "", fallback, flags=re.IGNORECASE
+        ).strip()
     return fallback or station_name
 
 
@@ -205,20 +219,31 @@ def extract_city_and_location(card):
     h4 = card.select_one("h4")
     if not h4:
         return None, None
+
     city_element = h4.select_one("a")
     if not city_element:
         return None, normalize_spaces(h4.get_text(" ", strip=True))
+
     city = normalize_spaces(city_element.get_text(" ", strip=True))
-    full_location = normalize_spaces(h4.get_text(" ", strip=True))
-    location = full_location
+    location = normalize_spaces(h4.get_text(" ", strip=True))
     if city and location:
-        location = re.sub(rf"^\s*{re.escape(city)}\s*[,\-:]?\s*", "", location, count=1, flags=re.IGNORECASE)
+        location = re.sub(
+            rf"^\s*{re.escape(city)}\s*[,\-:]?\s*",
+            "",
+            location,
+            count=1,
+            flags=re.IGNORECASE,
+        )
         location = location.replace('"', "").strip(" ,")
+
     return city, location
 
 
 def find_station_cards(soup):
-    return [card for card in soup.select("div.row") if card.select_one("h1 a") and card.select_one("h4") and card.select_one("table.table")]
+    return [
+        card for card in soup.select("div.row")
+        if card.select_one("h1 a") and card.select_one("h4") and card.select_one("table.table")
+    ]
 
 
 def scrape_station_card(card):
@@ -226,6 +251,7 @@ def scrape_station_card(card):
     station_title = extract_station_name(card)
     if not station_title:
         return results
+
     city, location = extract_city_and_location(card)
     region = get_region_by_city(city)
     station = normalize_station_name(station_title, city=city)
@@ -233,23 +259,37 @@ def scrape_station_card(card):
     table = card.select_one("table.table")
     if not table:
         return results
+
     for row in table.select("tbody tr"):
         cells = row.select("td")
         if len(cells) < 3:
             continue
+
         product_raw = normalize_spaces(cells[1].get_text(" ", strip=True))
         price_raw = normalize_spaces(cells[2].get_text(" ", strip=True))
         if not product_raw or not price_raw:
             continue
+
         fuel = normalize_fuel_name(product_raw)
         if not fuel:
             continue
+
         try:
             price = clean_price(price_raw)
         except ValueError as exc:
             print(f"[PRICE] {station_title} | {product_raw} | {exc}")
             continue
-        results.append({"created_at": created_at, "city": city, "station": station, "fuel": fuel, "price": price, "region": region, "location": location})
+
+        results.append({
+            "created_at": created_at,
+            "city": city,
+            "station": station,
+            "fuel": fuel,
+            "price": price,
+            "region": region,
+            "location": location,
+        })
+
     print(f"[STATION] {station_title} | {city or '-'} | {len(results)} fuel prices")
     return results
 
@@ -258,6 +298,7 @@ def scrape_all_pages():
     all_results = []
     empty_pages = 0
     driver = create_driver()
+
     try:
         for offset in range(0, MAX_OFFSET + PAGE_STEP, PAGE_STEP):
             url = make_page_url(offset)
@@ -267,79 +308,162 @@ def scrape_all_pages():
                 print(f"[ERROR] Could not load {url}: {exc}")
                 empty_pages += 1
                 if empty_pages >= EMPTY_PAGE_LIMIT:
+                    print("[STOP] Too many consecutive failed/empty pages.")
                     break
                 continue
+
             cards = find_station_cards(soup)
             print(f"[PAGE] offset={offset} | station cards={len(cards)}")
+
             if not cards:
                 empty_pages += 1
                 if empty_pages >= EMPTY_PAGE_LIMIT:
+                    print(f"[STOP] {EMPTY_PAGE_LIMIT} consecutive pages without station cards.")
                     break
                 continue
+
             empty_pages = 0
             for card in cards:
                 all_results.extend(scrape_station_card(card))
             print(f"[TOTAL] rows collected so far: {len(all_results):,}")
     finally:
         driver.quit()
+
     if not all_results:
         return pd.DataFrame(columns=COLUMNS)
-    return pd.DataFrame(all_results, columns=COLUMNS).drop_duplicates(subset=DEDUP_COLUMNS).reset_index(drop=True)
+
+    df = pd.DataFrame(all_results, columns=COLUMNS)
+    df = df.drop_duplicates(subset=IN_RUN_DEDUP_COLUMNS).reset_index(drop=True)
+    return df
 
 
 def get_supabase() -> Client:
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
     if not url or not key:
-        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables")
+        raise RuntimeError(
+            "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables"
+        )
     return create_client(url, key)
 
 
-def fetch_existing_rows(client: Client):
-    existing = []
+def canonical_text(value):
+    if value is None:
+        return ""
+    return normalize_spaces(value) or ""
+
+
+def station_fuel_key(row):
+    return tuple(canonical_text(row.get(col)) for col in STATION_FUEL_KEY_COLUMNS)
+
+
+def canonical_price(value):
+    try:
+        return Decimal(str(value)).normalize()
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def fetch_latest_prices(client: Client):
+    """Return the latest known price for every station/fuel identity in Supabase."""
+    latest_by_key = {}
     start = 0
     page_size = 1000
+    select_columns = ["created_at", "price", *STATION_FUEL_KEY_COLUMNS]
+
     while True:
-        response = client.table(SUPABASE_TABLE).select(",".join(DEDUP_COLUMNS)).range(start, start + page_size - 1).execute()
+        response = (
+            client.table(SUPABASE_TABLE)
+            .select(",".join(select_columns))
+            .order("created_at", desc=True)
+            .range(start, start + page_size - 1)
+            .execute()
+        )
         batch = response.data or []
-        existing.extend(batch)
+
+        # Because rows arrive newest-first, the first row seen for a key is its
+        # current/most recent database state.
+        for row in batch:
+            key = station_fuel_key(row)
+            if key not in latest_by_key:
+                latest_by_key[key] = canonical_price(row.get("price"))
+
         if len(batch) < page_size:
             break
         start += page_size
-    return existing
+
+    print(f"[SUPABASE] Current station/fuel states loaded: {len(latest_by_key):,}")
+    return latest_by_key
 
 
-def row_key(row):
-    return tuple("" if row.get(col) is None else str(row.get(col)) for col in DEDUP_COLUMNS)
-
-
-def remove_previous_duplicates(client: Client, df: pd.DataFrame):
+def keep_latest_scraped_state(df: pd.DataFrame):
+    """Keep only the newest scraped observation per station/fuel identity."""
     if df.empty:
         return df
-    existing_rows = fetch_existing_rows(client)
-    existing_keys = {row_key(row) for row in existing_rows}
+
+    work = df.copy()
+    work["_parsed_created_at"] = pd.to_datetime(work["created_at"], utc=True, errors="coerce")
+    work = work.sort_values("_parsed_created_at", kind="stable")
+    work = work.drop_duplicates(subset=STATION_FUEL_KEY_COLUMNS, keep="last")
+    work = work.drop(columns=["_parsed_created_at"])
+    return work.reset_index(drop=True)
+
+
+def remove_unchanged_prices(client: Client, df: pd.DataFrame):
+    """
+    Insert a row only when:
+      * this station/fuel does not exist yet in Supabase, or
+      * its newly scraped price differs from the latest stored price.
+
+    Therefore a price that changes 1.60 -> 1.62 -> 1.60 is preserved as three
+    historical changes, while repeated 1.60 scrapes are not stored again.
+    """
+    if df.empty:
+        return df
+
+    latest_prices = fetch_latest_prices(client)
+    df = keep_latest_scraped_state(df)
     records = df.where(pd.notnull(df), None).to_dict(orient="records")
-    new_records = [row for row in records if row_key(row) not in existing_keys]
-    print(f"[DEDUP] Existing Supabase rows: {len(existing_rows):,}")
-    print(f"[DEDUP] Scraped rows: {len(records):,}")
-    print(f"[DEDUP] New rows to insert: {len(new_records):,}")
-    return pd.DataFrame(new_records, columns=COLUMNS)
+
+    changed_records = []
+    unchanged_count = 0
+
+    for row in records:
+        key = station_fuel_key(row)
+        new_price = canonical_price(row.get("price"))
+        previous_price = latest_prices.get(key)
+
+        if key not in latest_prices or new_price != previous_price:
+            changed_records.append(row)
+            latest_prices[key] = new_price
+        else:
+            unchanged_count += 1
+
+    print(f"[DEDUP] Latest scraped station/fuel states: {len(records):,}")
+    print(f"[DEDUP] Unchanged prices skipped: {unchanged_count:,}")
+    print(f"[DEDUP] New/changed prices to insert: {len(changed_records):,}")
+
+    return pd.DataFrame(changed_records, columns=COLUMNS)
 
 
 def upload_to_supabase(client: Client, df: pd.DataFrame):
     if df.empty:
-        print("[SUPABASE] Nothing new to insert.")
+        print("[SUPABASE] Nothing new or changed to insert.")
         return
+
     records = df.where(pd.notnull(df), None).to_dict(orient="records")
     batch_size = 500
+
     for i in range(0, len(records), batch_size):
-        client.table(SUPABASE_TABLE).insert(records[i:i + batch_size]).execute()
+        batch = records[i:i + batch_size]
+        client.table(SUPABASE_TABLE).insert(batch).execute()
         print(f"[SUPABASE] Inserted {min(i + batch_size, len(records)):,}/{len(records):,}")
 
 
 if __name__ == "__main__":
     df = scrape_all_pages()
-    print(f"\nRows after in-run deduplication: {len(df):,}")
+    print(f"\nRows after in-run exact deduplication: {len(df):,}")
+
     df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
     print(f"CSV saved: {OUTPUT_CSV}")
 
@@ -347,5 +471,5 @@ if __name__ == "__main__":
         raise RuntimeError("Scraper returned no rows; refusing to write to Supabase")
 
     supabase = get_supabase()
-    new_df = remove_previous_duplicates(supabase, df)
-    upload_to_supabase(supabase, new_df)
+    changed_df = remove_unchanged_prices(supabase, df)
+    upload_to_supabase(supabase, changed_df)
