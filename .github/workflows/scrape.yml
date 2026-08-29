@@ -3,13 +3,19 @@ name: Fuelo scraper
 on:
   workflow_dispatch:
   schedule:
-    # GitHub Actions cron uses UTC.
-    # Bulgaria summer time (UTC+3): 07:00, 10:00, 12:00, 15:00, 17:00.
+    # Target Bulgaria local times: 07:00, 10:00, 12:00, 15:00, 17:00.
+    # GitHub cron is UTC, so we schedule both summer (UTC+3) and winter (UTC+2)
+    # candidates and use the Sofia-time gate below to run only at the requested hour.
     - cron: "0 4 * * *"
+    - cron: "0 5 * * *"
     - cron: "0 7 * * *"
+    - cron: "0 8 * * *"
     - cron: "0 9 * * *"
+    - cron: "0 10 * * *"
     - cron: "0 12 * * *"
+    - cron: "0 13 * * *"
     - cron: "0 14 * * *"
+    - cron: "0 15 * * *"
 
 concurrency:
   group: fuelo-scraper
@@ -21,22 +27,53 @@ jobs:
     timeout-minutes: 60
 
     steps:
+      - name: Check Bulgaria scrape window
+        id: window
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          event = os.environ.get("EVENT_NAME", "")
+          now = datetime.now(ZoneInfo("Europe/Sofia"))
+          target_hours = {7, 10, 12, 15, 17}
+
+          should_run = event == "workflow_dispatch" or now.hour in target_hours
+
+          print(f"Sofia time: {now.isoformat()}")
+          print(f"Target hours: {sorted(target_hours)}")
+          print(f"Should run: {should_run}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"should_run={'true' if should_run else 'false'}\n")
+          PY
+
       - name: Checkout repository
+        if: steps.window.outputs.should_run == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python
+        if: steps.window.outputs.should_run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
       - name: Install Chrome
+        if: steps.window.outputs.should_run == 'true'
         uses: browser-actions/setup-chrome@v1
 
       - name: Install dependencies
+        if: steps.window.outputs.should_run == 'true'
         run: pip install -r requirements.txt
 
       - name: Run scraper and sync Supabase
+        if: steps.window.outputs.should_run == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -44,7 +81,7 @@ jobs:
         run: python main.py
 
       - name: Upload CSV debug artifact
-        if: always()
+        if: always() && steps.window.outputs.should_run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: fuelo-scrape-${{ github.run_id }}
