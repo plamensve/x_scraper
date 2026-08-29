@@ -1,0 +1,5 @@
+.idea/
+__pycache__/
+*.pyc
+.env
+fuelo_all_prices.csv
