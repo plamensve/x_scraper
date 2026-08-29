@@ -3,9 +3,9 @@ name: Fuelo scraper
 on:
   workflow_dispatch:
   schedule:
-    # Target Bulgaria local times: 07:00, 10:00, 12:00, 15:00, 17:00.
-    # GitHub cron is UTC, so we schedule both summer (UTC+3) and winter (UTC+2)
-    # candidates and use the Sofia-time gate below to run only at the requested hour.
+    # Bulgaria local targets: 07:00, 10:00, 12:00, 15:00, 17:00.
+    # GitHub cron is UTC. Both summer and winter candidates are registered;
+    # the gate below selects the correct set from Europe/Sofia's UTC offset.
     - cron: "0 4 * * *"
     - cron: "0 5 * * *"
     - cron: "0 7 * * *"
@@ -40,13 +40,34 @@ jobs:
           from zoneinfo import ZoneInfo
 
           event = os.environ.get("EVENT_NAME", "")
+          schedule = os.environ.get("EVENT_SCHEDULE", "")
           now = datetime.now(ZoneInfo("Europe/Sofia"))
-          target_hours = {7, 10, 12, 15, 17}
+          offset_hours = int(now.utcoffset().total_seconds() // 3600)
 
-          should_run = event == "workflow_dispatch" or now.hour in target_hours
+          summer_schedules = {
+              "0 4 * * *",   # 07:00 Sofia
+              "0 7 * * *",   # 10:00 Sofia
+              "0 9 * * *",   # 12:00 Sofia
+              "0 12 * * *",  # 15:00 Sofia
+              "0 14 * * *",  # 17:00 Sofia
+          }
+          winter_schedules = {
+              "0 5 * * *",   # 07:00 Sofia
+              "0 8 * * *",   # 10:00 Sofia
+              "0 10 * * *",  # 12:00 Sofia
+              "0 13 * * *",  # 15:00 Sofia
+              "0 15 * * *",  # 17:00 Sofia
+          }
+
+          if event == "workflow_dispatch":
+              should_run = True
+          else:
+              valid_schedules = summer_schedules if offset_hours == 3 else winter_schedules
+              should_run = schedule in valid_schedules
 
           print(f"Sofia time: {now.isoformat()}")
-          print(f"Target hours: {sorted(target_hours)}")
+          print(f"Scheduled candidate: {schedule or 'manual'}")
+          print(f"UTC offset: +{offset_hours}")
           print(f"Should run: {should_run}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
@@ -78,7 +99,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SUPABASE_TABLE: ${{ vars.SUPABASE_TABLE || 'fuel_prices' }}
-        run: python main.py
+        run: python runner.py
 
       - name: Upload CSV debug artifact
         if: always() && steps.window.outputs.should_run == 'true'
