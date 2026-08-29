@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 import time
+from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -8,16 +10,13 @@ import pandas as pd
 
 import main as base
 
-# Fuelo occasionally returns a lightweight/empty page on pagination requests.
-# Retry each page before deciding that it is empty.
 PAGE_RETRIES = 3
 RETRY_DELAY_SECONDS = 3
 NO_NEW_PAGE_LIMIT = 5
 MAX_PAGE_INDEX = 1000
+DEBUG_DIR = Path("debug")
+DEBUG_DIR.mkdir(exist_ok=True)
 
-# Cities observed in Fuelo that were missing from the original static map.
-# Keep these explicit so the region stored in Supabase stays compatible with
-# the website's existing filters.
 EXTRA_CITY_TO_REGION = {
     "Божурище": "София област",
     "Вакарел": "София област",
@@ -33,17 +32,51 @@ _original_normalize_fuel_name = base.normalize_fuel_name
 def normalize_fuel_name(product):
     raw = base.normalize_spaces(product)
     if raw and raw.casefold() in {
-        "газ",
-        "газ lpg",
-        "газ пропан бутан",
-        "газ пропан-бутан",
-        "propane gas",
+        "газ", "газ lpg", "газ пропан бутан", "газ пропан-бутан", "propane gas"
     }:
         return "Пропан Бутан"
     return _original_normalize_fuel_name(product)
 
 
 base.normalize_fuel_name = normalize_fuel_name
+
+
+def safe_name(url):
+    value = re.sub(r"^https?://", "", url)
+    value = re.sub(r"[^a-zA-Z0-9._-]+", "_", value)
+    return value[-150:]
+
+
+def save_debug(driver, url, reason):
+    """Persist exactly what Chrome received so failed Actions runs are diagnosable."""
+    stamp = datetime.now(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
+    stem = f"{stamp}_{reason}_{safe_name(url)}"
+    html_path = DEBUG_DIR / f"{stem}.html"
+    png_path = DEBUG_DIR / f"{stem}.png"
+    meta_path = DEBUG_DIR / f"{stem}.txt"
+
+    try:
+        html_path.write_text(driver.page_source or "", encoding="utf-8")
+    except Exception as exc:
+        print(f"[DEBUG] Could not save HTML: {exc}")
+
+    try:
+        driver.save_screenshot(str(png_path))
+    except Exception as exc:
+        print(f"[DEBUG] Could not save screenshot: {exc}")
+
+    try:
+        title = driver.title
+        current_url = driver.current_url
+        meta_path.write_text(
+            f"requested_url={url}\ncurrent_url={current_url}\ntitle={title}\nreason={reason}\n",
+            encoding="utf-8",
+        )
+        print(f"[DEBUG] title={title!r} current_url={current_url}")
+    except Exception as exc:
+        print(f"[DEBUG] Could not save metadata: {exc}")
+
+    print(f"[DEBUG] Saved diagnostics under {DEBUG_DIR}/ for {url}")
 
 
 def page_fingerprint(cards):
@@ -56,7 +89,6 @@ def page_fingerprint(cards):
 
 
 def load_cards(driver, url, first_page=False):
-    """Load one Fuelo page with retries and return its station cards."""
     last_html_size = 0
     for attempt in range(1, PAGE_RETRIES + 1):
         try:
@@ -75,20 +107,12 @@ def load_cards(driver, url, first_page=False):
         if attempt < PAGE_RETRIES:
             time.sleep(RETRY_DELAY_SECONDS * attempt)
 
+    save_debug(driver, url, "no_cards")
     print(f"[PAGE] Giving up on {url}; last HTML size={last_html_size:,}")
     return []
 
 
 def scrape_all_pages():
-    """
-    Scrape Fuelo using adaptive pagination.
-
-    Older Fuelo URLs have behaved like offset pagination (/page/20, /page/40,
-    ...), while deployments can also expose page-number pagination
-    (/page/1, /page/2, ...). We probe both forms and continue with the one that
-    actually returns a new page. This prevents a single empty /page/20 response
-    from truncating the scrape after the first page.
-    """
     all_results = []
     driver = base.create_driver()
     scraped_at = datetime.now(ZoneInfo("UTC")).isoformat()
@@ -118,8 +142,6 @@ def scrape_all_pages():
             raise RuntimeError("Fuelo first page returned no station cards after retries")
         consume(first_cards, "first page")
 
-        # Probe Fuelo's offset-style pagination first because that is the form
-        # historically used by this repository.
         offset_probe = base.PAGE_STEP
         offset_url = base.make_page_url(offset_probe)
         offset_cards = load_cards(driver, offset_url)
@@ -163,9 +185,7 @@ def scrape_all_pages():
             else:
                 no_new_pages += 1
                 if no_new_pages >= NO_NEW_PAGE_LIMIT:
-                    print(
-                        f"[STOP] {NO_NEW_PAGE_LIMIT} consecutive pages produced no new station page."
-                    )
+                    print(f"[STOP] {NO_NEW_PAGE_LIMIT} consecutive pages produced no new station page.")
                     break
     finally:
         driver.quit()
@@ -174,39 +194,23 @@ def scrape_all_pages():
         return pd.DataFrame(columns=base.COLUMNS)
 
     df = pd.DataFrame(all_results, columns=base.COLUMNS)
-    df = df.drop_duplicates(
-        subset=base.IN_RUN_DEDUP_COLUMNS,
-        keep="last",
-    ).reset_index(drop=True)
-    return df
+    return df.drop_duplicates(subset=base.IN_RUN_DEDUP_COLUMNS, keep="last").reset_index(drop=True)
 
 
 def prepare_for_supabase(df: pd.DataFrame) -> pd.DataFrame:
-    """Prevent one unmapped city from failing the entire Supabase batch."""
     if df.empty:
         return df
-
     missing_region = df["region"].isna() | (df["region"].astype(str).str.strip() == "")
     if missing_region.any():
-        missing_cities = sorted(
-            str(value)
-            for value in df.loc[missing_region, "city"].dropna().unique().tolist()
-        )
-        print(
-            "[REGION] Skipping rows with unknown region instead of failing the whole run: "
-            + ", ".join(missing_cities)
-        )
+        missing_cities = sorted(str(v) for v in df.loc[missing_region, "city"].dropna().unique().tolist())
+        print("[REGION] Skipping rows with unknown region instead of failing the whole run: " + ", ".join(missing_cities))
         df = df.loc[~missing_region].copy()
-
     return df.reset_index(drop=True)
 
 
 def main():
     df = scrape_all_pages()
     print(f"\nRows after in-run deduplication: {len(df):,}")
-
-    # Keep the full debug CSV, including any row whose city still needs a new
-    # region mapping. Only Supabase upload is filtered for schema safety.
     df.to_csv(base.OUTPUT_CSV, index=False, encoding="utf-8-sig")
     print(f"CSV saved: {base.OUTPUT_CSV}")
 
