@@ -12,10 +12,11 @@ import main as base
 DEBUG_DIR = Path("debug")
 DEBUG_DIR.mkdir(exist_ok=True)
 
-# We prefer useful partial coverage over aggressive retries that can increase
-# the chance of a Cloudflare challenge.
-MAX_OFFSET = 1000
-PAGE_STEP = 20
+# Fuelo's last_updated listing advances in 30-record offsets:
+# /page/30, /page/60, ... (e.g. /page/390, /page/600).
+# Using /page/20 was the reason we never reached valid pages such as /page/390.
+PAGE_STEP = 30
+MAX_OFFSET = 1200
 
 EXTRA_CITY_TO_REGION = {
     "Божурище": "София област",
@@ -95,7 +96,7 @@ def is_cloudflare_challenge(driver):
 
 
 def load_page(driver, url, first_page=False):
-    """Load exactly once and classify the result without challenge retries."""
+    """Load one Fuelo page once and classify the result without challenge retries."""
     try:
         soup = base.get_soup(driver, url, first_page=first_page)
     except Exception as exc:
@@ -159,11 +160,10 @@ def scrape_best_effort():
 
         consume(first_cards, "first page")
 
-        # Fuelo historically uses /page/20, /page/40, ... . Try each page once.
-        # The first Cloudflare challenge or empty page ends pagination, while
-        # preserving everything already collected from earlier pages.
+        # Valid Fuelo pagination uses 30-record offsets. Visit each valid page
+        # once and keep all useful rows collected before any Cloudflare challenge.
         for offset in range(PAGE_STEP, MAX_OFFSET + PAGE_STEP, PAGE_STEP):
-            url = base.make_page_url(offset)
+            url = f"{base.BASE_URL}/page/{offset}?lang=bg"
             cards, status = load_page(driver, url)
 
             if status == "challenge":
@@ -214,9 +214,6 @@ def main():
     df.to_csv(base.OUTPUT_CSV, index=False, encoding="utf-8-sig")
     print(f"CSV saved: {base.OUTPUT_CSV}")
 
-    # A run with no fuel rows is not a pipeline failure. The latest Fuelo page
-    # can temporarily contain only EV stations or Cloudflare can challenge the
-    # runner. In either case we leave Supabase untouched and try again later.
     if df.empty:
         print("[BEST-EFFORT] No fuel rows collected. Supabase left unchanged; run completes successfully.")
         return
