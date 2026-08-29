@@ -1,0 +1,51 @@
+name: Fuelo scraper
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions cron uses UTC.
+    # Defaults below are 07:00, 13:00 and 19:00 Bulgaria summer time (UTC+3).
+    - cron: "0 4 * * *"
+    - cron: "0 10 * * *"
+    - cron: "0 16 * * *"
+
+concurrency:
+  group: fuelo-scraper
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper and sync Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_TABLE: ${{ vars.SUPABASE_TABLE || 'fuel_prices' }}
+        run: python main.py
+
+      - name: Upload CSV debug artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuelo-scrape-${{ github.run_id }}
+          path: fuelo_all_prices.csv
+          if-no-files-found: ignore
+          retention-days: 7
