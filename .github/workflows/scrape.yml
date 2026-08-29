@@ -45,18 +45,10 @@ jobs:
           offset_hours = int(now.utcoffset().total_seconds() // 3600)
 
           summer_schedules = {
-              "0 4 * * *",   # 07:00 Sofia
-              "0 7 * * *",   # 10:00 Sofia
-              "0 9 * * *",   # 12:00 Sofia
-              "0 12 * * *",  # 15:00 Sofia
-              "0 14 * * *",  # 17:00 Sofia
+              "0 4 * * *", "0 7 * * *", "0 9 * * *", "0 12 * * *", "0 14 * * *",
           }
           winter_schedules = {
-              "0 5 * * *",   # 07:00 Sofia
-              "0 8 * * *",   # 10:00 Sofia
-              "0 10 * * *",  # 12:00 Sofia
-              "0 13 * * *",  # 15:00 Sofia
-              "0 15 * * *",  # 17:00 Sofia
+              "0 5 * * *", "0 8 * * *", "0 10 * * *", "0 13 * * *", "0 15 * * *",
           }
 
           if event == "workflow_dispatch":
@@ -101,11 +93,13 @@ jobs:
           SUPABASE_TABLE: ${{ vars.SUPABASE_TABLE || 'fuel_prices' }}
         run: python runner.py
 
-      - name: Upload CSV debug artifact
+      - name: Upload scraper diagnostics
         if: always() && steps.window.outputs.should_run == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: fuelo-scrape-${{ github.run_id }}
-          path: fuelo_all_prices.csv
-          if-no-files-found: ignore
+          name: fuelo-debug-${{ github.run_id }}
+          path: |
+            fuelo_all_prices.csv
+            debug/**
+          if-no-files-found: warn
           retention-days: 7
