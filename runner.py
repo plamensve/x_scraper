@@ -14,9 +14,11 @@ DEBUG_DIR.mkdir(exist_ok=True)
 
 # Fuelo's last_updated listing advances in 30-record offsets:
 # /page/30, /page/60, ... (e.g. /page/390, /page/600).
-# Using /page/20 was the reason we never reached valid pages such as /page/390.
 PAGE_STEP = 30
 MAX_OFFSET = 1200
+# Do not let one blocked/empty page abort the entire scrape. Stop only after
+# several consecutive unusable pagination pages to keep request volume bounded.
+MAX_CONSECUTIVE_FAILURES = 8
 
 EXTRA_CITY_TO_REGION = {
     "Божурище": "София област",
@@ -105,7 +107,7 @@ def load_page(driver, url, first_page=False):
         return [], "error"
 
     if is_cloudflare_challenge(driver):
-        print(f"[CLOUDFLARE] Challenge detected at {url}; stopping pagination for this run.")
+        print(f"[CLOUDFLARE] Challenge detected at {url}; skipping this page.")
         save_debug(driver, url, "cloudflare")
         return [], "challenge"
 
@@ -138,9 +140,11 @@ def scrape_best_effort():
         if not cards:
             return 0
         fingerprint = page_fingerprint(cards)
-        if not fingerprint or fingerprint in seen_pages:
-            print(f"[PAGE] {label} duplicates an already seen page; stopping pagination.")
-            return -1
+        if not fingerprint:
+            return 0
+        if fingerprint in seen_pages:
+            print(f"[PAGE] {label} duplicates an already seen page; skipping it.")
+            return 0
         seen_pages.add(fingerprint)
 
         before = len(all_results)
@@ -155,26 +159,56 @@ def scrape_best_effort():
         first_cards, first_status = load_page(driver, first_url, first_page=True)
 
         if first_status != "ok":
-            print(f"[BEST-EFFORT] First page unavailable ({first_status}); finishing without Supabase changes.")
-            return pd.DataFrame(columns=base.COLUMNS)
+            print(f"[BEST-EFFORT] First page unavailable ({first_status}); continuing with pagination probes.")
+        else:
+            consume(first_cards, "first page")
 
-        consume(first_cards, "first page")
+        consecutive_failures = 0
+        attempted_pages = 0
+        successful_pages = 0
 
-        # Valid Fuelo pagination uses 30-record offsets. Visit each valid page
-        # once and keep all useful rows collected before any Cloudflare challenge.
+        # Visit valid 30-record offsets. A challenge, empty response, load error,
+        # or duplicate page affects only that offset. This lets later pages such
+        # as /page/390 still be attempted when an earlier page is unavailable.
         for offset in range(PAGE_STEP, MAX_OFFSET + PAGE_STEP, PAGE_STEP):
+            attempted_pages += 1
             url = f"{base.BASE_URL}/page/{offset}?lang=bg"
             cards, status = load_page(driver, url)
 
-            if status == "challenge":
-                print(f"[BEST-EFFORT] Pagination stopped at offset={offset} because of Cloudflare.")
-                break
-            if status in {"empty", "error"}:
-                print(f"[BEST-EFFORT] Pagination stopped at offset={offset} ({status}).")
-                break
+            if status != "ok":
+                consecutive_failures += 1
+                print(
+                    f"[BEST-EFFORT] Skipping offset={offset} ({status}); "
+                    f"consecutive failures={consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}."
+                )
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    print(
+                        "[BEST-EFFORT] Failure limit reached; stopping pagination "
+                        "to avoid excessive requests."
+                    )
+                    break
+                continue
 
-            if consume(cards, f"offset={offset}") == -1:
-                break
+            fingerprint = page_fingerprint(cards)
+            if not fingerprint or fingerprint in seen_pages:
+                consecutive_failures += 1
+                print(
+                    f"[BEST-EFFORT] offset={offset} is empty/duplicate; "
+                    f"consecutive failures={consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}."
+                )
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    print("[BEST-EFFORT] Failure limit reached; stopping pagination.")
+                    break
+                continue
+
+            successful_pages += 1
+            consecutive_failures = 0
+            consume(cards, f"offset={offset}")
+
+        print(
+            f"[PAGINATION] attempted={attempted_pages}, successful={successful_pages}, "
+            f"fuel_rows={len(all_results):,}"
+        )
     finally:
         driver.quit()
 
